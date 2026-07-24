@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Professional Telegram Bot – FULL Webhook Version (Render)
-Maxfiy kanal (invite link) orqali majburiy obuna qo‘shish imkoniyati bilan.
+Professional Telegram Bot – FULL Webhook + Auto-Approve Join Requests
+Maxfiy kanal so‘rovlarini avtomatik tasdiqlaydi.
 Barcha funksiyalar to‘liq.
 """
 
@@ -47,7 +47,6 @@ def init_database() -> None:
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
 
-    # Jadval yaratish (channel_username TEXT, chat_id INTEGER, invite_link TEXT)
     cur.executescript("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -89,7 +88,7 @@ def init_database() -> None:
         );
     """)
 
-    # Auto‑migration: add winners_count if missing (prizes)
+    # Auto‑migration: add winners_count if missing
     try:
         cur.execute("SELECT winners_count FROM prizes LIMIT 1")
     except sqlite3.OperationalError:
@@ -175,10 +174,20 @@ def clear_state(uid: int) -> None:
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 # ----------------------------------------------------------------------
+# AUTO-APPROVE JOIN REQUESTS (YANGI)
+# ----------------------------------------------------------------------
+@bot.chat_join_request_handler()
+def auto_approve_join(join_request: types.ChatJoinRequest):
+    try:
+        bot.approve_chat_join_request(join_request.chat.id, join_request.from_user.id)
+        logger.info(f"Auto-approved join request for user {join_request.from_user.id} in chat {join_request.chat.id}")
+    except Exception as e:
+        logger.error(f"Failed to approve join request: {e}")
+
+# ----------------------------------------------------------------------
 # SUBSCRIPTION CHECK
 # ----------------------------------------------------------------------
 def get_required_channels() -> List[Dict]:
-    """Return list of channel dicts with channel_username, chat_id, invite_link."""
     rows = db_execute("SELECT channel_username, chat_id, invite_link FROM channels", fetch=True)
     return rows if rows else []
 
@@ -208,7 +217,7 @@ def send_subscription_prompt(chat_id: int):
     markup = types.InlineKeyboardMarkup(row_width=1)
     for ch in channels:
         if ch.get("invite_link"):
-            text += f"👉 Maxfiy kanal\n"
+            text += "👉 Maxfiy kanal\n"
             markup.add(types.InlineKeyboardButton("➕ Kanalga qo‘shilish", url=ch["invite_link"]))
         elif ch.get("channel_username"):
             name = ch["channel_username"].replace("@", "")
@@ -730,7 +739,7 @@ def broadcast_cancel_cb(call):
     bot.edit_message_text("Bekor qilindi.", call.message.chat.id, call.message.message_id)
 
 # ----------------------------------------------------------------------
-# MANDATORY SUBSCRIPTION MANAGEMENT (UPDATED FOR PRIVATE CHANNELS)
+# MANDATORY SUBSCRIPTION MANAGEMENT
 # ----------------------------------------------------------------------
 def show_sub_management(chat_id):
     markup = types.InlineKeyboardMarkup()
@@ -752,13 +761,8 @@ def sub_add_prompt(call):
 
 def sub_add_process(msg):
     text = msg.text.strip()
-    chat_id = None
-    username = None
-    invite_link = None
-
     if text.startswith("@"):
         username = text
-        # Bazaga qo‘shish
         db_execute("INSERT INTO channels (channel_username, added_date, added_by) VALUES (?,?,?)",
                    (username, datetime.now().isoformat(), msg.from_user.id))
         bot.send_message(msg.chat.id, f"✅ @{username} qo‘shildi.")
@@ -766,23 +770,20 @@ def sub_add_process(msg):
     elif text.startswith("-100") and text[1:].isdigit():
         try:
             chat_id = int(text)
-            chat = bot.get_chat(chat_id)  # tekshirish
-            # invite_link bo‘lmasa, keyin qo‘shimcha so‘rash mumkin, hozircha bo‘sh qo‘yamiz
-            invite_link = None
-            db_execute("INSERT INTO channels (chat_id, invite_link, added_date, added_by) VALUES (?,?,?,?)",
-                       (chat_id, invite_link, datetime.now().isoformat(), msg.from_user.id))
+            chat = bot.get_chat(chat_id)
+            db_execute("INSERT INTO channels (chat_id, added_date, added_by) VALUES (?,?,?)",
+                       (chat_id, datetime.now().isoformat(), msg.from_user.id))
             bot.send_message(msg.chat.id, f"✅ Maxfiy kanal (ID: {chat_id}) qo‘shildi.")
             clear_state(msg.chat.id)
         except:
             bot.send_message(msg.chat.id, "Chat topilmadi yoki bot a'zo emas.")
     elif text.startswith("https://t.me/+"):
         invite_link = text
-        # Invite link orqali chat_id ni aniqlash imkonsiz, shuning uchun admin chat_id kiritishi kerak
         set_state(msg.chat.id, "sub_add_chatid", {"invite_link": invite_link})
         bot.send_message(msg.chat.id, "Iltimos, shu kanalning Chat ID sini kiriting (masalan: -1001234567890):")
         bot.register_next_step_handler(msg, sub_add_chatid)
     else:
-        bot.send_message(msg.chat.id, "Iltimos @username, Chat ID yoki invite link yuboring.")
+        bot.send_message(msg.chat.id, "Noto‘g‘ri format. Iltimos @username, Chat ID yoki invite link yuboring.")
         bot.register_next_step_handler(msg, sub_add_process)
 
 def sub_add_chatid(msg):
@@ -1211,7 +1212,8 @@ if __name__ == "__main__":
     init_database()
     if WEBHOOK_URL:
         bot.remove_webhook()
-        bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
+        # Join request handler ni qo‘llab-quvvatlash uchun allowed_updates
+        bot.set_webhook(url=f"{WEBHOOK_URL}/webhook", allowed_updates=["message", "callback_query", "chat_join_request"])
         logger.info(f"Webhook set to {WEBHOOK_URL}/webhook")
     else:
         logger.warning("WEBHOOK_URL not set. Webhook won't work.")
