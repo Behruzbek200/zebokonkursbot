@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Professional Telegram Bot – FULL Webhook Version (Render)
-All functions included.
+Maxfiy kanal (invite link) orqali majburiy obuna qo‘shish imkoniyati bilan.
+Barcha funksiyalar to‘liq.
 """
 
 import os
@@ -46,6 +47,7 @@ def init_database() -> None:
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
 
+    # Jadval yaratish (channel_username TEXT, chat_id INTEGER, invite_link TEXT)
     cur.executescript("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -59,7 +61,9 @@ def init_database() -> None:
         );
         CREATE TABLE IF NOT EXISTS channels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            channel_username TEXT UNIQUE,
+            channel_username TEXT,
+            chat_id INTEGER,
+            invite_link TEXT,
             added_date TEXT,
             added_by INTEGER
         );
@@ -85,7 +89,7 @@ def init_database() -> None:
         );
     """)
 
-    # Auto‑migration: add winners_count if missing
+    # Auto‑migration: add winners_count if missing (prizes)
     try:
         cur.execute("SELECT winners_count FROM prizes LIMIT 1")
     except sqlite3.OperationalError:
@@ -173,30 +177,45 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 # ----------------------------------------------------------------------
 # SUBSCRIPTION CHECK
 # ----------------------------------------------------------------------
-def get_required_channels() -> List[str]:
-    rows = db_execute("SELECT channel_username FROM channels", fetch=True)
-    return [r["channel_username"] for r in rows] if rows else []
+def get_required_channels() -> List[Dict]:
+    """Return list of channel dicts with channel_username, chat_id, invite_link."""
+    rows = db_execute("SELECT channel_username, chat_id, invite_link FROM channels", fetch=True)
+    return rows if rows else []
 
 def check_subscription(user_id: int) -> bool:
     for ch in get_required_channels():
-        try:
-            member = bot.get_chat_member(ch, user_id)
-            if member.status not in ["creator", "administrator", "member"]:
+        if ch.get("chat_id"):
+            try:
+                member = bot.get_chat_member(ch["chat_id"], user_id)
+                if member.status not in ["creator", "administrator", "member"]:
+                    return False
+            except:
                 return False
-        except:
-            return False
+        elif ch.get("channel_username"):
+            try:
+                member = bot.get_chat_member(ch["channel_username"], user_id)
+                if member.status not in ["creator", "administrator", "member"]:
+                    return False
+            except:
+                return False
     return True
 
 def send_subscription_prompt(chat_id: int):
     channels = get_required_channels()
     if not channels:
         return
-    text = "🔔 Botdan foydalanish uchun kanallarga obuna bo‘ling:\n\n"
+    text = "🔔 Botdan foydalanish uchun quyidagi kanallarga obuna bo‘ling:\n\n"
     markup = types.InlineKeyboardMarkup(row_width=1)
     for ch in channels:
-        name = ch.replace("@", "")
-        text += f"👉 @{name}\n"
-        markup.add(types.InlineKeyboardButton(f"➕ @{name}", url=f"https://t.me/{name}"))
+        if ch.get("invite_link"):
+            text += f"👉 Maxfiy kanal\n"
+            markup.add(types.InlineKeyboardButton("➕ Kanalga qo‘shilish", url=ch["invite_link"]))
+        elif ch.get("channel_username"):
+            name = ch["channel_username"].replace("@", "")
+            text += f"👉 @{name}\n"
+            markup.add(types.InlineKeyboardButton(f"➕ @{name}", url=f"https://t.me/{name}"))
+        elif ch.get("chat_id"):
+            text += f"👉 Maxfiy kanal (ID: {ch['chat_id']})\n"
     markup.add(types.InlineKeyboardButton("✅ Tekshirish", callback_data="check_subscription"))
     bot.send_message(chat_id, text, reply_markup=markup, disable_web_page_preview=True)
 
@@ -711,51 +730,116 @@ def broadcast_cancel_cb(call):
     bot.edit_message_text("Bekor qilindi.", call.message.chat.id, call.message.message_id)
 
 # ----------------------------------------------------------------------
-# MANDATORY SUBSCRIPTION
+# MANDATORY SUBSCRIPTION MANAGEMENT (UPDATED FOR PRIVATE CHANNELS)
 # ----------------------------------------------------------------------
 def show_sub_management(chat_id):
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("➕ Kanal qo‘shish", callback_data="sub_add"))
     markup.add(types.InlineKeyboardButton("➖ Kanal o‘chirish", callback_data="sub_remove"))
     markup.add(types.InlineKeyboardButton("📋 Ro‘yxat", callback_data="sub_list"))
-    bot.send_message(chat_id, "Majburiy obuna:", reply_markup=markup)
+    bot.send_message(chat_id, "Majburiy obuna boshqaruvi:", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data == "sub_add")
 def sub_add_prompt(call):
     if not is_admin(call.from_user.id): return
     set_state(call.message.chat.id, "sub_add")
-    msg = bot.send_message(call.message.chat.id, "Kanal username @ bilan:")
+    msg = bot.send_message(call.message.chat.id,
+        "Kanalni qanday qo‘shasiz?\n"
+        "• @username (masalan: @kanal)\n"
+        "• Chat ID (masalan: -1001234567890)\n"
+        "• Invite link (https://t.me/+ABCDEF)")
     bot.register_next_step_handler(msg, sub_add_process)
 
 def sub_add_process(msg):
-    channel = msg.text.strip()
-    if not channel.startswith("@"):
-        bot.send_message(msg.chat.id, "@ bilan boshlanishi kerak."); return
-    db_execute("INSERT OR IGNORE INTO channels (channel_username, added_date, added_by) VALUES (?,?,?)",
-               (channel, datetime.now().isoformat(), msg.from_user.id))
-    bot.send_message(msg.chat.id, f"✅ {channel} qo‘shildi.")
+    text = msg.text.strip()
+    chat_id = None
+    username = None
+    invite_link = None
+
+    if text.startswith("@"):
+        username = text
+        # Bazaga qo‘shish
+        db_execute("INSERT INTO channels (channel_username, added_date, added_by) VALUES (?,?,?)",
+                   (username, datetime.now().isoformat(), msg.from_user.id))
+        bot.send_message(msg.chat.id, f"✅ @{username} qo‘shildi.")
+        clear_state(msg.chat.id)
+    elif text.startswith("-100") and text[1:].isdigit():
+        try:
+            chat_id = int(text)
+            chat = bot.get_chat(chat_id)  # tekshirish
+            # invite_link bo‘lmasa, keyin qo‘shimcha so‘rash mumkin, hozircha bo‘sh qo‘yamiz
+            invite_link = None
+            db_execute("INSERT INTO channels (chat_id, invite_link, added_date, added_by) VALUES (?,?,?,?)",
+                       (chat_id, invite_link, datetime.now().isoformat(), msg.from_user.id))
+            bot.send_message(msg.chat.id, f"✅ Maxfiy kanal (ID: {chat_id}) qo‘shildi.")
+            clear_state(msg.chat.id)
+        except:
+            bot.send_message(msg.chat.id, "Chat topilmadi yoki bot a'zo emas.")
+    elif text.startswith("https://t.me/+"):
+        invite_link = text
+        # Invite link orqali chat_id ni aniqlash imkonsiz, shuning uchun admin chat_id kiritishi kerak
+        set_state(msg.chat.id, "sub_add_chatid", {"invite_link": invite_link})
+        bot.send_message(msg.chat.id, "Iltimos, shu kanalning Chat ID sini kiriting (masalan: -1001234567890):")
+        bot.register_next_step_handler(msg, sub_add_chatid)
+    else:
+        bot.send_message(msg.chat.id, "Iltimos @username, Chat ID yoki invite link yuboring.")
+        bot.register_next_step_handler(msg, sub_add_process)
+
+def sub_add_chatid(msg):
+    text = msg.text.strip()
+    state = get_state(msg.chat.id)
+    if not state or state[0] != "sub_add_chatid":
+        return
+    if not text.startswith("-100"):
+        bot.send_message(msg.chat.id, "Noto‘g‘ri Chat ID. Qayta urinib ko‘ring.")
+        bot.register_next_step_handler(msg, sub_add_chatid)
+        return
+    try:
+        chat_id = int(text)
+        chat = bot.get_chat(chat_id)
+    except:
+        bot.send_message(msg.chat.id, "Chat topilmadi yoki bot a'zo emas.")
+        return
+    invite_link = state[1].get("invite_link", "")
+    db_execute("INSERT INTO channels (chat_id, invite_link, added_date, added_by) VALUES (?,?,?,?)",
+               (chat_id, invite_link, datetime.now().isoformat(), msg.from_user.id))
+    bot.send_message(msg.chat.id, "✅ Kanal qo‘shildi.")
     clear_state(msg.chat.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "sub_remove")
 def sub_remove_list(call):
-    channels = get_required_channels()
+    channels = db_execute("SELECT id, channel_username, chat_id, invite_link FROM channels", fetch=True)
     if not channels:
         bot.answer_callback_query(call.id, "Kanal yo‘q", show_alert=True); return
     markup = types.InlineKeyboardMarkup()
     for ch in channels:
-        markup.add(types.InlineKeyboardButton(ch, callback_data=f"sub_del:{ch}"))
-    bot.edit_message_text("O‘chirish uchun kanal:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+        if ch["channel_username"]:
+            label = ch["channel_username"]
+        elif ch["chat_id"]:
+            label = f"ID: {ch['chat_id']}"
+        else:
+            label = "Noma'lum"
+        markup.add(types.InlineKeyboardButton(label, callback_data=f"sub_del:{ch['id']}"))
+    bot.edit_message_text("O‘chirish uchun kanalni tanlang:", call.message.chat.id, call.message.message_id, reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("sub_del:"))
 def sub_del(call):
-    channel = call.data.split(":")[1]
-    db_execute("DELETE FROM channels WHERE channel_username=?", (channel,))
-    bot.edit_message_text(f"✅ {channel} o‘chirildi.", call.message.chat.id, call.message.message_id)
+    ch_id = int(call.data.split(":")[1])
+    db_execute("DELETE FROM channels WHERE id=?", (ch_id,))
+    bot.edit_message_text("✅ Kanal o‘chirildi.", call.message.chat.id, call.message.message_id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "sub_list")
 def sub_list(call):
-    chs = get_required_channels()
-    txt = "\n".join(chs) if chs else "Kanal yo‘q."
+    channels = db_execute("SELECT channel_username, chat_id, invite_link FROM channels", fetch=True)
+    if not channels:
+        txt = "Kanal yo‘q."
+    else:
+        txt = "📋 Majburiy kanallar:\n"
+        for ch in channels:
+            if ch["channel_username"]:
+                txt += f"• {ch['channel_username']}\n"
+            elif ch["chat_id"]:
+                txt += f"• Maxfiy kanal (ID: {ch['chat_id']})\n"
     bot.edit_message_text(txt, call.message.chat.id, call.message.message_id)
 
 # ----------------------------------------------------------------------
