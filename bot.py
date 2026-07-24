@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Professional Telegram Bot – FULL Webhook + Auto-Approve Join Requests
-Maxfiy kanal so‘rovlarini avtomatik tasdiqlaydi.
+Professional Telegram Bot – Webhook version.
+Maxfiy kanalga so‘rov yuborgan foydalanuvchilarga ruxsat beradi (kanalga qo‘shmaydi).
 Barcha funksiyalar to‘liq.
 """
 
@@ -23,7 +23,7 @@ from flask import Flask, request, abort
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
 SUPER_ADMIN_ID = int(os.environ.get("SUPER_ADMIN_ID", "123456789"))
 DB_NAME = os.environ.get("DB_NAME", "bot.db")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. https://your-app.onrender.com
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
 # ----------------------------------------------------------------------
 # LOGGING
@@ -66,6 +66,12 @@ def init_database() -> None:
             added_date TEXT,
             added_by INTEGER
         );
+        CREATE TABLE IF NOT EXISTS join_requests (
+            user_id INTEGER,
+            chat_id INTEGER,
+            request_date TEXT,
+            PRIMARY KEY (user_id, chat_id)
+        );
         CREATE TABLE IF NOT EXISTS prizes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT,
@@ -88,12 +94,11 @@ def init_database() -> None:
         );
     """)
 
-    # Auto‑migration: add winners_count if missing
+    # migration
     try:
         cur.execute("SELECT winners_count FROM prizes LIMIT 1")
-    except sqlite3.OperationalError:
+    except:
         cur.execute("ALTER TABLE prizes ADD COLUMN winners_count INTEGER DEFAULT 0")
-        logger.info("Migration: added winners_count column.")
 
     defaults = {
         "bot_name": "My Awesome Bot",
@@ -105,16 +110,10 @@ def init_database() -> None:
         "admin_username": ""
     }
     for k, v in defaults.items():
-        try:
-            cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
-        except Exception as e:
-            logger.error(f"Default setting {k}: {e}")
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
 
-    try:
-        cur.execute("INSERT OR IGNORE INTO admins (user_id, added_by, date) VALUES (?, ?, ?)",
-                    (SUPER_ADMIN_ID, SUPER_ADMIN_ID, datetime.now().isoformat()))
-    except Exception as e:
-        logger.error(f"Super admin insert: {e}")
+    cur.execute("INSERT OR IGNORE INTO admins (user_id, added_by, date) VALUES (?, ?, ?)",
+                (SUPER_ADMIN_ID, SUPER_ADMIN_ID, datetime.now().isoformat()))
 
     conn.commit()
     conn.close()
@@ -174,18 +173,21 @@ def clear_state(uid: int) -> None:
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 # ----------------------------------------------------------------------
-# AUTO-APPROVE JOIN REQUESTS (YANGI)
+# JOIN REQUEST HANDLER – faqat yozib qo‘yish, tasdiqlamaslik
 # ----------------------------------------------------------------------
 @bot.chat_join_request_handler()
-def auto_approve_join(join_request: types.ChatJoinRequest):
+def handle_join_request(join_request: types.ChatJoinRequest):
     try:
-        bot.approve_chat_join_request(join_request.chat.id, join_request.from_user.id)
-        logger.info(f"Auto-approved join request for user {join_request.from_user.id} in chat {join_request.chat.id}")
+        db_execute(
+            "INSERT OR IGNORE INTO join_requests (user_id, chat_id, request_date) VALUES (?, ?, ?)",
+            (join_request.from_user.id, join_request.chat.id, datetime.now().isoformat())
+        )
+        logger.info(f"Join request recorded for user {join_request.from_user.id} in chat {join_request.chat.id}")
     except Exception as e:
-        logger.error(f"Failed to approve join request: {e}")
+        logger.error(f"Failed to record join request: {e}")
 
 # ----------------------------------------------------------------------
-# SUBSCRIPTION CHECK
+# SUBSCRIPTION CHECK (endi join_requests ham tekshiriladi)
 # ----------------------------------------------------------------------
 def get_required_channels() -> List[Dict]:
     rows = db_execute("SELECT channel_username, chat_id, invite_link FROM channels", fetch=True)
@@ -194,11 +196,19 @@ def get_required_channels() -> List[Dict]:
 def check_subscription(user_id: int) -> bool:
     for ch in get_required_channels():
         if ch.get("chat_id"):
+            # avval a'zolikni tekshir
             try:
                 member = bot.get_chat_member(ch["chat_id"], user_id)
-                if member.status not in ["creator", "administrator", "member"]:
-                    return False
+                if member.status in ["creator", "administrator", "member"]:
+                    continue  # a'zo, keyingi kanalga o't
             except:
+                pass
+            # a'zo bo'lmasa, join request yuborganligini tekshir
+            req = db_execute(
+                "SELECT * FROM join_requests WHERE user_id = ? AND chat_id = ?",
+                (user_id, ch["chat_id"]), fetchone=True
+            )
+            if not req:
                 return False
         elif ch.get("channel_username"):
             try:
@@ -217,7 +227,7 @@ def send_subscription_prompt(chat_id: int):
     markup = types.InlineKeyboardMarkup(row_width=1)
     for ch in channels:
         if ch.get("invite_link"):
-            text += "👉 Maxfiy kanal\n"
+            text += "👉 Maxfiy kanal (so‘rov yuborish kifoya)\n"
             markup.add(types.InlineKeyboardButton("➕ Kanalga qo‘shilish", url=ch["invite_link"]))
         elif ch.get("channel_username"):
             name = ch["channel_username"].replace("@", "")
@@ -783,7 +793,7 @@ def sub_add_process(msg):
         bot.send_message(msg.chat.id, "Iltimos, shu kanalning Chat ID sini kiriting (masalan: -1001234567890):")
         bot.register_next_step_handler(msg, sub_add_chatid)
     else:
-        bot.send_message(msg.chat.id, "Noto‘g‘ri format. Iltimos @username, Chat ID yoki invite link yuboring.")
+        bot.send_message(msg.chat.id, "Noto‘g‘ri format.")
         bot.register_next_step_handler(msg, sub_add_process)
 
 def sub_add_chatid(msg):
@@ -1212,7 +1222,6 @@ if __name__ == "__main__":
     init_database()
     if WEBHOOK_URL:
         bot.remove_webhook()
-        # Join request handler ni qo‘llab-quvvatlash uchun allowed_updates
         bot.set_webhook(url=f"{WEBHOOK_URL}/webhook", allowed_updates=["message", "callback_query", "chat_join_request"])
         logger.info(f"Webhook set to {WEBHOOK_URL}/webhook")
     else:
