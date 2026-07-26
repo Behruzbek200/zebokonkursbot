@@ -194,16 +194,18 @@ def get_required_channels() -> List[Dict]:
     return rows if rows else []
 
 def check_subscription(user_id: int) -> bool:
+    # Adminlar har doim o‘tkaziladi
+    if is_admin(user_id):
+        return True
+
     for ch in get_required_channels():
         if ch.get("chat_id"):
-            # avval a'zolikni tekshir
             try:
                 member = bot.get_chat_member(ch["chat_id"], user_id)
                 if member.status in ["creator", "administrator", "member"]:
-                    continue  # a'zo, keyingi kanalga o't
+                    continue
             except:
                 pass
-            # a'zo bo'lmasa, join request yuborganligini tekshir
             req = db_execute(
                 "SELECT * FROM join_requests WHERE user_id = ? AND chat_id = ?",
                 (user_id, ch["chat_id"]), fetchone=True
